@@ -1,0 +1,21 @@
+[package]
+name = "my_rustsync"
+version = "0.2.3"
+description = "A pure Rust implementation of rsync"
+license = "Apache-2.0/MIT"
+authors = ["pe@pijul.org <pe@pijul.org>"]
+include = [ "Cargo.toml", "src/lib.rs" ]
+documentation = "https://docs.rs/rustsync"
+repository = "https://nest.pijul.com/pmeunier/rustsync"
+
+[dependencies]
+adler32 = "1.0"
+blake2-rfc = "0.2"
+serde = "1.0"
+serde_derive = "1.0"
+futures = "0.1"
+tokio-io = "0.1"
+
+[dev-dependencies]
+rand = "0.4"
+tokio-core = "0.1"

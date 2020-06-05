@@ -1,0 +1,380 @@
+use lazy_static::{lazy_static};
+use confy;
+use serde::{Serialize, Deserialize};
+use std::{env, thread, time, fs, string::String, collections::HashMap};
+use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
+use notify::*;
+use chrono;
+use my_rustsync::*;
+use rusoto_core::{Region};
+use rusoto_sqs::{Sqs, SqsClient, ListQueueTagsRequest, CreateQueueRequest, DeleteMessageBatchRequest,
+                 DeleteMessageBatchRequestEntry, ReceiveMessageRequest, SendMessageRequest, ReceiveMessageResult, Message};
+use rusoto_s3::{S3, S3Client, HeadBucketRequest, PutObjectRequest, GetObjectRequest, StreamingBody};
+use std::io::prelude::*;
+use std::fs::File;
+use std::io::SeekFrom;
+use tokio::task;
+use tokio::io;
+
+const CHUNK_SIZE : usize = 10485760;
+
+
+#[tokio::main]
+async fn main() {
+
+    env::set_var("AWS_ACCESS_KEY_ID", "AKIA2QRIVLMNRYIIVVMB");
+    env::set_var("AWS_SECRET_ACCESS_KEY", "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");
+
+    let sqs = SqsClient::new(Region::UsEast1);
+
+    let sqs_request = ReceiveMessageRequest {
+        queue_url: format!("https://sqs.us-east-1.amazonaws.com/722713533211/sync-upstream-{}.fifo", "test"),
+        max_number_of_messages: Some(10),
+        ..Default::default()
+    };
+
+    let s3 = S3Client::new(Region::UsEast1);
+
+    // let mut block_buf = Vec::new();
+
+    // match s3.get_object(GetObjectRequest {
+    //     bucket: String::from("sync-storage"),
+    //     key: "64487817".to_string(),
+    //     ..Default::default()
+    // }).await {
+    //     Ok(obj) => {
+    //         let mut body = obj.body.unwrap().into_async_read();
+    //         io::copy(&mut body, &mut block_buf).await;
+    //         println!("body: {:?}", block_buf);
+    //         // let block = obj.body.unwrap().into_async_read().await.unwrap();
+    //     }
+    //     Err(e) => {
+    //         println!("e: {:?}", e);
+    //     }
+    // }
+
+    let mut metastore: HashMap<String, Signature> = HashMap::new();
+    metastore.insert("/opt/sync/dir3/file1".to_string(), Signature {
+        window: CHUNK_SIZE,
+        chunks: HashMap::new()
+    });
+
+    metastore.insert("/opt/sync/dir3/file2".to_string(), Signature {
+        window: CHUNK_SIZE,
+        chunks: HashMap::new()
+    });
+
+    let s1 = fs::read("/opt/sync/dir3/file1").expect("Unable to read!");
+    let block_src = vec![0; 10485760];
+    println!("done...");
+    let s1_sig = signature(&s1[..], block_src.clone()).unwrap();
+    metastore.insert("/opt/sync/dir3/file1".to_string(), s1_sig);
+
+    loop {
+        /* try to receive messages from the sync server before handling local events */
+        println!("{:?}", metastore);
+        let event_msgs = receive_messages(&sqs, sqs_request.clone()).await;
+        for event_msg in event_msgs {
+            handle_event_message(&event_msg, &mut metastore, &s3).await;
+            println!("em: {:?}", event_msg);
+        }
+        for x in 0..5 {
+            thread::sleep(time::Duration::from_secs(x));
+            println!("slept for {} seconds...", x);
+        }
+    }
+}
+
+async fn receive_messages(sqs: &SqsClient, req: ReceiveMessageRequest) -> Vec<EventMessage> {
+    let mut ems = Vec::new();
+    let mut receipts = Vec::new();
+    let qurl: String = req.queue_url.clone();
+
+    let result = tokio::time::timeout(time::Duration::from_secs(30), sqs.receive_message(req)).await;
+    match result {
+        /* love rust pattern matching */
+        Ok(Ok(ReceiveMessageResult { messages: Some(msgs) })) => {
+            /* messages were recv'd, now you should process them! */
+            for m in msgs {
+                let em: EventMessage = serde_json::from_str(&m.body.unwrap())
+                                        .unwrap_or(EventMessage { e: None, d: None, });
+                ems.push(em);
+                /* if a message doesn't have a receipt handle, that is horrible and will break things
+                    (at that point, AWS is probably down or bugged) */
+                receipts.push(m.receipt_handle.unwrap());
+            }
+            /* now batch delete the messages that were recv'd, block until done */
+            let mut r_id = -1;
+            let req = DeleteMessageBatchRequest {
+                /* ah yes, rust's iter-map functionality... it's great! */
+                entries: receipts.into_iter().map(|r| {
+                    r_id += 1;
+                    DeleteMessageBatchRequestEntry { id: r_id.to_string(), receipt_handle: r}
+                }).collect(),
+                queue_url: qurl,
+            };
+            if let Err(e) = sqs.delete_message_batch(req).await {
+                /* couldn't delete messages, drop the event msgs!
+                    (otherwise we would receive them again) */
+                println!("{:?}", e);
+                ems.clear();
+            }
+        },
+        /* This handles the case of an http dispatch error (occuring usually after a reconnect)*/
+        Ok(Err(e)) => {
+            println!("Ok(e): {:?}", e);
+        },
+        /* This is a timeout from the recv request (dropped connection) */
+        Err(e) => {
+            println!("e: {:?}", e);
+        },
+        /* This is when request is successful, but no messages recv'd */
+        _ => ()
+    };
+    /* return a vec of eventmsgs (to send to handler), empty in case of errors */
+    ems
+}
+
+async fn handle_event_message(em: &EventMessage, metastore: &mut HashMap<String, Signature>, s3: &S3Client) {
+    match &em.e {
+        Some(Event::Write(filename)) => {
+            /* a file write requires the most work by far */
+            let f = format!("{}{}", "/opt/sync/", filename);
+            println!("f: {}", f);
+            match &em.d {
+                Some(d) => {
+                    handle_file_write(&f, &d, metastore, s3).await;
+                },
+                None => {
+                    // log
+                }
+            }
+        },
+        Some(Event::Rename(f_filename, t_filename)) => {
+            /* re-assemble the correct file paths for each filename */
+            let f = format!("{}{}", "/opt/sync/", f_filename);
+            let t = format!("{}{}", "/opt/sync/", t_filename);
+            /* rename the file, watcher should drop events for the file until done */
+            if let Err(e) = fs::rename(&f, &t) {
+                println!("{}", e); // REPLACE THIS
+                return;
+            }
+            match fs::metadata(&t) {
+                Ok(md) => {
+                    if md.is_dir() {
+                        if let Err(e) = handle_dir_rename(&t, &f, metastore) {
+                            // error
+                        }
+                    } else {
+                        /* "simple" file rename */
+                        handle_file_rename(&f, &t, metastore);
+                    }
+                },
+                Err(e) => {
+                    // error
+                }
+            }
+
+        },
+        Some(Event::Remove(filename)) => {
+            /* re-assemble the correct file paths for each filename */
+            let f = format!("{}{}", "/opt/sync/", filename);
+            /* rename the file, watcher should drop events for the file until done */
+            match fs::metadata(&f) {
+                Ok(md) => {
+                    if md.is_dir() {
+                        /* remove all the stuffs in the dir */
+                        /* BUT, have to go through it and remove each file from the metastore */
+                        /* dirs do not have entries in the metastore, but they may have files */
+
+                        if let Err(e) = handle_dir_removal(&f, metastore) {
+                            // error
+                        }
+
+                        if let Err(e) = fs::remove_dir_all(&f) {
+                            // error
+                        }
+                    } else {
+                        /* only delete the file */
+                        if let Err(e) = fs::remove_file(&f) {
+                            // error
+                        }
+                        /* get rid of the file from the metastore */
+                        metastore.remove(&f);
+                    }
+                },
+                Err(e) => {
+                    // file doesn't exist or error reading
+                }
+            }
+        },
+        None => {}
+    }
+}
+
+async fn handle_file_write(path: &String, delta: &MyDelta, metastore: &mut HashMap<String, Signature>, s3: &S3Client) {
+    let mut block_buf = Vec::new();
+    /* This is naive in terms of memory, but I'm going to memoize S3 chunks...
+        in other words, map chunk id to the data */
+    let block_map: HashMap<u32, StreamingBody> = HashMap::new();
+    /* As it stands, the easiest way to do this is to basically read file into mem */
+    match fs::read(path) {
+        Ok(source) => {
+            let file = fs::OpenOptions::new().write(true).open(path);
+            match file {
+                Ok(mut mod_file) => {
+                    for chunk in &delta.blocks {
+                        println!("here");
+                        match chunk {
+                            MyBlock::FromSource(offset) => {
+                                let offset_u = *offset as usize;
+                                let offset_end : usize = if offset_u + CHUNK_SIZE <= source.len() { offset_u + CHUNK_SIZE } else { source.len() };
+                                if let Err(e) = mod_file.write_all(&source[offset_u..offset_end]) {
+                                    // log
+                                    println!("e: {:?}", e);
+                                }
+                            },
+                            MyBlock::Literal(chunk_id) => {
+                                /* chunk must be retrieved from S3... ideally, there would be a local chunk
+                                    mapping which would allow reading chunks from other files (if they are present)
+                                    instead of making requests to S3 (much faster) */
+                                /* This is also where I will cache chunks */
+                                match s3.get_object(GetObjectRequest {
+                                    bucket: String::from("sync-storage"),
+                                    key: chunk_id.to_string(),
+                                    ..Default::default()
+                                }).await {
+                                    Ok(obj) => {
+                                        let mut body = obj.body.unwrap().into_async_read();
+                                        io::copy(&mut body, &mut block_buf).await;
+                                        if let Err(e) = mod_file.write_all(&block_buf) {
+                                            println!("e: {:?}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("e: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("{}", e);
+                }
+            }
+            /* work that needs to be done is done, now we have to update the signature,
+                unfortunately, the only way with what we have is to read it again (bleh) */
+            match fs::read(path) {
+                Ok(source) => {
+                    /* compute the new signature and store it */
+                    let sig = signature(&source[..], vec![0; CHUNK_SIZE]).unwrap();
+                    metastore.insert(path.to_string(), sig);
+                },
+                Err(e) => {
+                    println!("{}", e);
+                }
+            }
+        },
+        Err(e) => {
+            // log
+        }
+    }
+}
+
+fn handle_file_rename(path_f: &String, path_t: &String, metastore: &mut HashMap<String, Signature>) {
+    /* replace the f-sig with the t-sig */
+    let block_buf = vec![0; CHUNK_SIZE];
+    let sig : Signature;
+    /* remove the old entry, or compute hash of t if no entry */
+    if let Some(f_sig) = metastore.remove(path_f) {
+        sig = f_sig;
+    } else {
+        /* if can't open file (maybe it got deleted), just log and continue */
+        match fs::read(path_t) {
+            Ok(source) => {
+                /* have the signature now */
+                println!("{:?}", source);
+                sig = signature(&source[..], block_buf.clone()).unwrap();
+            },
+            Err(e) => {
+                // log(LogLevel::Warning, &format!("Could not read source file! :: {}", e))
+                return;
+            }
+        };
+    };
+    /* update t in metastore (doesn't matter if t was already there, file is already gone) */
+    metastore.insert(path_t.to_string(), sig);
+}
+
+fn handle_dir_rename(path: &String, path_old: &String, metastore: &mut HashMap<String, Signature>) -> Result<()> {
+    match fs::read_dir(path) {
+        Ok(ents) => {
+            for ent in ents {
+                /* unwrap the entry since read dir returns them as results */
+                let entry = ent?;
+                let entry_path = entry.path();
+                let path_str = entry_path.clone().into_os_string().into_string().unwrap();
+                let filename = entry_path.as_path().file_name().unwrap().to_str().unwrap();
+                if entry_path.is_dir() {
+                    /* recurse on a dir */
+                    handle_dir_rename(&path_str, path_old, metastore)?;
+                } else {
+                    /* remove and re-insert the updated entry! */
+                    let old_path = format!("{}/{}", path_old, filename);
+                    println!("old_path: {}", old_path);
+                    if let Some(sig) = metastore.remove(&old_path) {
+                        /* valid entry, put it back with the modified path */
+                        /* pathing stuff really should be accomplished using `Path`s,
+                            but I was completely unaware of them until too late */
+                        metastore.insert(format!("{}/{}", path, filename), sig);
+                        println!("new entry: {:?}", format!("{}{}", path, filename));
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            // error
+        }
+    }
+    Ok(())
+}
+
+fn handle_dir_removal(path: &String, metastore: &mut HashMap<String, Signature>) -> Result<()> {
+    match fs::read_dir(path) {
+        Ok(ents) => {
+            for ent in ents {
+                /* unwrap the entry since read dir returns them as results */
+                let entry = ent?;
+                let entry_path = entry.path();
+                let path_str = entry_path.clone().into_os_string().into_string().unwrap();
+                if entry_path.is_dir() {
+                    /* recurse on a dir */
+                    handle_dir_removal(&path_str, metastore)?;
+                } else {
+                    /* remove the entry! */
+                    metastore.remove(&path_str);
+                }
+            }
+        },
+        Err(e) => {
+            // error
+        }
+    }
+    Ok(())
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+enum Event {
+    Write(String),
+    Rename(String, String),
+    Remove(String)
+}
+
+/* struct to serialize to send via sqs */
+#[derive(Debug, Serialize, Deserialize)]
+struct EventMessage {
+    e: Option<Event>,
+    d: Option<MyDelta>,
+}

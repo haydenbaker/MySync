@@ -1,0 +1,40 @@
+[package]
+name = "testing"
+version = "0.1.0"
+authors = ["haydenbaker <hkbaker@calpoly.edu>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.2", features = ["full"] }
+# rustsync = "0.2.3"
+# notify = "4.0.15"
+# inotify = "0.8.2"
+bincode = "1.2.1"
+lazy_static = "1.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "*"
+confy = "0.4.0"
+chrono = "0.4.11"
+adler32 = "1.0"
+rusoto_core = "0.43.0"
+rusoto_sts = "0.43.0"
+rusoto_sqs = "0.43.0"
+rusoto_s3 = "0.43.0"
+rusoto_dynamodb = "0.43.0"
+pickledb = "0.4.1"
+blake2-rfc = "0.2"
+walkdir = "2.3.1"
+crossbeam = "0.7.3"
+
+my_rustsync = { path = "my_rustsync" }
+my_notify = { path = "my_notify" }
+
+[[bin]]
+name = "client"
+path = "src/client/main.rs"
+
+[[bin]]
+name = "server"
+path = "src/server/main.rs"

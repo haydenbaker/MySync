@@ -1,0 +1,87 @@
+use my_rustsync::*;
+use notify::*;
+use std::fs;
+use std::sync::mpsc::channel;
+use std::{collections::HashMap};
+use bincode;
+// use snap;
+use std::time;
+// use fastcdc;
+use adler32;
+
+
+fn main() {
+
+    // let (tx, rx) = channel();
+
+    // let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
+
+    // watcher.watch("/opt/sync", RecursiveMode::Recursive).unwrap();
+
+    // loop {
+    //     match rx.recv() {
+    //         Ok(event) => match event {
+    //             DebouncedEvent::Create(f) => println!("create: {:?}", f),
+    //             DebouncedEvent::Write(f) => println!("modify: {:?}", f),
+    //             DebouncedEvent::Rename(f, t) => println!("rename: {:?} -> {:?}", f, t),
+    //             _ => println!("ignore: {:?}", event),
+    //         },
+    //         Err(e) => println!("error: {:?}", e),
+    //     }
+    // }
+    // println!("done...");
+    let source = fs::read("file1").expect("Unable to read!");
+    let modified = fs::read("file1_mod").expect("Unable to read!");
+
+    let block_src = vec![0; 4];
+    let block_mod = vec![0; 4];
+    println!("done...");
+    let source_sig = signature(&source[..], block_src.clone()).unwrap();
+    let mod_sig = signature(&modified[..], block_mod.clone()).unwrap();
+
+    // let source_sig = Signature {
+    //     window: 4,
+    //     chunks: HashMap::new(),
+    // };
+
+    let comp = my_compare(&source_sig, &modified[..], block_src).unwrap();
+
+    // let mut restored = Vec::new();
+    // restore(&mut restored, &modified[..], &comp).expect("Unable to diff!");
+
+
+    println!("\nsource_sig: {:?}", source_sig);
+    println!("\nmod_sig: {:?}", mod_sig);
+    println!("\ncomp: {:?}", comp);
+
+    // /* run this on each of the chunks we need to send */
+    // println!("block_sig: {}", adler32::RollingAdler32::from_buffer(&[98, 98, 98, 98]).hash());
+
+    // // source_sig.chunks;
+    // println!("\nsource.sig.chunks : {:?}", source_sig.chunks.keys());
+    // println!("mod.sig.chunks : {:?}", mod_sig.chunks.keys());
+
+    // for (k, v) in mod_sig.chunks.iter().filter(|&(k, _)| !source_sig.chunks.contains_key(k)) {
+    //     println!("new chunk : {:?}", (k, v.values().next().unwrap()));
+    // }
+
+    // println!("source_sig : {:?}", source_sig);
+    // println!("num chunks : {:?}", source_sig.chunks.keys().len());
+
+    // convert MyDelta into a Delta to restore from
+    // Need to load chunks requested from s3 into to spots for writing
+    // write(restore(&mut resoted, &source[..], myd2d(&comp)));
+
+
+    fs::write("comp", bincode::serialize(&comp).unwrap()).expect("Unable to write!");
+    // fs::read()
+    // fs::write("delta", bincode::serialize(&comp.blocks).unwrap()).expect("Unable to write!");
+    // fs::write("file1_restored", restored).expect("Unable to write!");
+
+    // let contents = fs::read("file1").unwrap();
+    // println!("{:?}", contents);
+    // let chunker = fastcdc::FastCDC::new(&contents, 65536, 65536, 65536);
+    // for entry in chunker {
+    //     println!("offset={}, size={}", entry.offset, entry.length);
+    // }
+}
