@@ -1,10 +1,8 @@
 use pickledb::{PickleDb};
-use std::sync::{Arc, RwLock};
 use rusoto_s3::{S3, S3Client, PutObjectRequest, GetObjectRequest};
-use rusoto_sqs::{Sqs, SqsClient, DeleteMessageBatchRequest,
-                 DeleteMessageBatchRequestEntry, ReceiveMessageRequest, SendMessageRequest, ReceiveMessageResult, Message};
+use rusoto_sqs::{Sqs, SqsClient, SendMessageRequest};
 use my_rustsync::*;
-use std::{path::Path, fs, fs::File, string::String, collections::HashMap, collections::HashSet};
+use std::{path::Path, fs, fs::File, string::String, collections::HashMap};
 use tokio::io;
 use my_notify::{Result, inotify::INotifyWatcher};
 use std::io::prelude::*;
@@ -35,7 +33,9 @@ pub fn resync_dir(path: &str, metastore: &PickleDb) -> Result<()> {
                 }
             }
         },
-        Err(e) => {}
+        Err(e) => {
+            log(LogLevel::Critical, &format!("Could not read directory {} :: {}", path, e));
+        }
     }
     Ok(())
 }
@@ -64,97 +64,94 @@ pub fn resync_file(path: &str, metastore: &PickleDb) -> Result<()> {
 }
 
 pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, metastore: &mut PickleDb, watcher: &mut INotifyWatcher) {
-match msg {
-    /* a file or dir creation or modification */
-    Event::Write(f) => {
-        /* handle if f is dir here */
-        match fs::metadata(&f) {
-            Ok(md) => {
-                if md.is_dir() {
-                    /* f is a dir, handle dir create */
-                    handle_dir_create(&f, &s3, &sqs, metastore, watcher).await;
-                } else {
-                    /* f is a file, handle file create */
-                    handle_file_create(&f, &s3, &sqs, metastore).await;
-                }
-                watcher.watch(&f, RecursiveMode::NonRecursive);
-            },
-            Err(e) => {
-                /* unable to get the f's metadata, log it */
-                log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e))
-            }
-        }
-    },
-    /* a file or dir rename (AKA move) */
-    Event::Rename(f, t) => {
-        /* filenames for sqs message later */
-        let (_, f_filename) = f.split_at(CFG.sync_dir.len());
-        let (_, t_filename) = t.split_at(CFG.sync_dir.len());
-
-        let sig: Signature = match metastore.get(&f) {
-            Some(f_sig) => {
-                metastore.rem(&f);
-                f_sig
-            },
-            None => 
-                match fs::read(&t) {
-                    Ok(source) => {
-                        /* have the signature now */
-                        signature(&source[..], vec![0; CHUNK_SIZE]).unwrap()
-                    },
-                    Err(e) => {
-                        log(LogLevel::Warning, &format!("Could not read source file ({}) :: {}", t, e));
-                        return;
+    match msg {
+        /* a file or dir creation or modification */
+        Event::Write(f) => {
+            /* handle if f is dir here */
+            match fs::metadata(&f) {
+                Ok(md) => {
+                    if md.is_dir() {
+                        /* f is a dir, handle dir create */
+                        handle_dir_create(&f, &s3, &sqs, metastore, watcher).await;
+                    } else {
+                        /* f is a file, handle file create */
+                        handle_file_create(&f, &s3, &sqs, metastore).await;
                     }
+                    watcher.watch(&f, RecursiveMode::NonRecursive);
+                },
+                Err(e) => {
+                    /* unable to get the f's metadata, log it */
+                    log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e))
                 }
+            }
+        },
+        /* a file or dir rename (AKA move) */
+        Event::Rename(f, t) => {
+            /* filenames for sqs message later */
+            let (_, f_filename) = f.split_at(CFG.sync_dir.len());
+            let (_, t_filename) = t.split_at(CFG.sync_dir.len());
+
+            let sig: Signature = match metastore.get(&f) {
+                Some(f_sig) => {
+                    metastore.rem(&f);
+                    f_sig
+                },
+                None => 
+                    match fs::read(&t) {
+                        Ok(source) => {
+                            /* have the signature now */
+                            signature(&source[..], vec![0; CHUNK_SIZE]).unwrap()
+                        },
+                        Err(e) => {
+                            log(LogLevel::Warning, &format!("Could not read source file ({}) :: {}", t, e));
+                            return;
+                        }
+                    }
+                };
+            let request = SendMessageRequest {
+                message_body: serde_json::to_string(&EventMessage {
+                    c: Some(String::from(&CFG.client_id)),
+                    e: Some(Event::Rename(f_filename.to_string(), t_filename.to_string())),
+                    d: None,
+                }).unwrap(),                                   
+                message_group_id: Some(CFG.client_id.to_string()),
+                queue_url: CFG.sqs_downstream.clone(),
+                ..Default::default()
             };
-        let request = SendMessageRequest {
-            message_body: serde_json::to_string(&EventMessage {
-                c: Some(String::from(&CFG.client_id)),
-                e: Some(Event::Rename(f_filename.to_string(), t_filename.to_string())),
-                d: None,
-            }).unwrap(),                                   
-            message_group_id: Some(CFG.client_id.to_string()),
-            queue_url: CFG.sqs_downstream.clone(),
-            ..Default::default()
-        };
-        match sqs.send_message(request).await {
-            Ok(res) => log(LogLevel::Debug, &format!("Event(Rename::{} -> {}) Message (id: {}) succesfully sent downstream",
-                                                    f_filename, t_filename, res.message_id.unwrap())),
-            Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{} -> {}) Message failed to send :: {}",
-                                                    f_filename, t_filename, e))
-        }
-        /* update t in metastore (doesn't matter if t was already there, file is already gone) */
-        metastore.set(&t, &sig);
-        watcher.watch(&t, RecursiveMode::NonRecursive);
-    },
-    /* a file or dir remove */
-    Event::Remove(f) => {
-        let (_, f_filename) = f.split_at(CFG.sync_dir.len());
-        /* Send a remove message to sync server */
-        let request = SendMessageRequest {
-            message_body: serde_json::to_string(&EventMessage {
-                c: Some(String::from(&CFG.client_id)),
-                e: Some(Event::Remove(f_filename.to_string())),
-                d: None,
-            }).unwrap(),                                   
-            message_group_id: Some(CFG.client_id.to_string()),
-            queue_url: CFG.sqs_downstream.clone(),
-            ..Default::default()
-        };
-        match sqs.send_message(request).await {
-            Ok(res) => log(LogLevel::Debug, &format!("Event(Remove::{}) Message (id: {}) succesfully sent downstream",
-                                                    f_filename, res.message_id.unwrap())),
-            Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{}) Message failed to send :: {}",
-                                                    f_filename, e))
-        }
-        /* remove f from the metastore, or do nothing if not there */
-        metastore.rem(&f).unwrap();
-    },
-    _ => {
-        println!("skipperoni");
+            match sqs.send_message(request).await {
+                Ok(res) => log(LogLevel::Debug, &format!("Event(Rename::{} -> {}) Message (id: {}) succesfully sent downstream",
+                                                        f_filename, t_filename, res.message_id.unwrap())),
+                Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{} -> {}) Message failed to send :: {}",
+                                                        f_filename, t_filename, e))
+            }
+            /* update t in metastore (doesn't matter if t was already there, file is already gone) */
+            metastore.set(&t, &sig);
+            watcher.watch(&t, RecursiveMode::NonRecursive);
+        },
+        /* a file or dir remove */
+        Event::Remove(f) => {
+            let (_, f_filename) = f.split_at(CFG.sync_dir.len());
+            /* Send a remove message to sync server */
+            let request = SendMessageRequest {
+                message_body: serde_json::to_string(&EventMessage {
+                    c: Some(String::from(&CFG.client_id)),
+                    e: Some(Event::Remove(f_filename.to_string())),
+                    d: None,
+                }).unwrap(),                                   
+                message_group_id: Some(CFG.client_id.to_string()),
+                queue_url: CFG.sqs_downstream.clone(),
+                ..Default::default()
+            };
+            match sqs.send_message(request).await {
+                Ok(res) => log(LogLevel::Debug, &format!("Event(Remove::{}) Message (id: {}) succesfully sent downstream",
+                                                        f_filename, res.message_id.unwrap())),
+                Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{}) Message failed to send :: {}",
+                                                        f_filename, e))
+            }
+            /* remove f from the metastore, or do nothing if not there */
+            metastore.rem(&f).unwrap();
+        },
     }
-}
 }
 
 pub async fn handle_dir_create(path: &str, s3: &S3Client, sqs: &SqsClient, metastore: &mut PickleDb, watcher: &mut INotifyWatcher) {
@@ -193,7 +190,6 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
         Ok(source) => {
             /* compare signature against whatever is in metastore */
             let source_sig = signature(&source[..], vec![0; CHUNK_SIZE]).unwrap();
-            // println!("{:?}", source_sig);
             /* must figure out what new chunks to send to S3 */
             match metastore.get::<Signature>(path) {
                 Some(sig) => {
@@ -201,7 +197,6 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                         log(LogLevel::Debug, &format!("Event(Create::{}) contents identical", path));
                         return;
                     }
-                    println!("I am here!");
                     /* metastore has a record already, must compare, upload if not present */
                     for (k, v) in source_sig.chunks.iter().filter(|&(k, _)| !sig.chunks.contains_key(k)) {
                         /* check if chunks exists on s3 already */
@@ -209,9 +204,7 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                         /* chunk not present, so upload the chunk data using offset (in 'v') from signature */
                         let offset : usize = *v.values().next().unwrap();
                         let offset_end : usize = if offset + CHUNK_SIZE <= source.len() { offset + CHUNK_SIZE } else { source.len() };
-                        // println!("{:?}", &source[offset..offset_end]);
-                        /* TODO: Compress chunk before sending to S3 */
-                        /* TODO: Make it async (somewhat of a big rework though) */
+                        /* Really should compress chunk before sending to S3 */
                         match s3.put_object(PutObjectRequest {
                             bucket: String::from(&CFG.s3_bucket),
                             key: k.to_string(),
@@ -330,14 +323,13 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             blacklist_file(&t, watcher);
             /* rename the file */ 
             if let Err(e) = fs::rename(&f, &t) {
-                println!("{}", e); // REPLACE THIS
-                return;
+                return log(LogLevel::Critical, &format!("Could not rename file ({}->{}) :: {}", f, t, e));
             }
             match fs::metadata(&t) {
                 Ok(md) => {
                     if md.is_dir() {
                         if let Err(e) = apply_dir_rename(&t, &f, metastore) {
-                            // error
+                            return log(LogLevel::Critical, &format!("Could not apply directory rename ({}->{}) :: {}", f, t, e));
                         }
                     } else {
                         /* "simple" file rename */
@@ -345,7 +337,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
                     }
                 },
                 Err(e) => {
-                    // error
+                    return log(LogLevel::Critical, &format!("Could not read metadata from file ({}) :: {}", t, e));
                 }
             }
             unblacklist_file(&f, watcher);
@@ -366,23 +358,22 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
 
                         /* need to do the blacklisting within `apply_dir_removal` too */
                         if let Err(e) = apply_dir_removal(&f, metastore, watcher) {
-                            // error
+                            return log(LogLevel::Critical, &format!("Could not apply directory removal ({}) :: {}", f, e));
                         }
-
                         if let Err(e) = fs::remove_dir_all(&f) {
-                            // error
+                            return log(LogLevel::Critical, &format!("Could not remove all from directory ({}) :: {}", f, e));
                         }
                     } else {
                         /* only delete the file */
                         if let Err(e) = fs::remove_file(&f) {
-                            // error
+                            return log(LogLevel::Critical, &format!("Could not remove file ({}) :: {}", f, e));
                         }
                         /* get rid of the file from the metastore */
                         metastore.rem(&f);
                     }
                 },
                 Err(e) => {
-                    // file doesn't exist or error reading
+                    return log(LogLevel::Critical, &format!("Could not read metadata from file ({}) :: {}", f, e));
                 }
             }
             unblacklist_file(&f, watcher);
@@ -416,7 +407,7 @@ async fn write_chunk_from_s3(path: &str, id: u32, offset: usize, file: &mut File
     /* This is also where I will cache chunks */
     if let Some(buf) = block_map.get(&id) {
         if let Err(e) = file.write_all(&buf) {
-            println!("e: {:?}", e);
+            return log(LogLevel::Critical, &format!("Could not write all to file ({}) :: {}", path, e));
         }
         buf.len();
     }
@@ -440,7 +431,6 @@ async fn write_chunk_from_s3(path: &str, id: u32, offset: usize, file: &mut File
             let mut blake2 = [0; BLAKE2_SIZE];
             blake2.clone_from_slice(blake2_rfc::blake2b::blake2b(BLAKE2_SIZE, &[],
                                     &block_buf).as_bytes());
-            // println!("{:?} {:?}", block, blake2);
             sig.chunks.entry(id)
                             .or_insert(HashMap::new())
                             .insert(Blake2b(blake2), offset);
@@ -532,12 +522,10 @@ pub fn apply_file_rename(path_f: &str, path_t: &str, metastore: &mut PickleDb) {
         match fs::read(path_t) {
             Ok(source) => {
                 /* have the signature now */
-                println!("{:?}", source);
                 sig = signature(&source[..], block_buf).unwrap();
             },
             Err(e) => {
-                // log(LogLevel::Warning, &format!("Could not read source file! :: {}", e))
-                return;
+                return log(LogLevel::Warning, &format!("Could not read source file ({}) :: {}", path_t, e));
             }
         };
     };
@@ -560,14 +548,12 @@ pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb) ->
                 } else {
                     /* remove and re-insert the updated entry! */
                     let old_path = format!("{}/{}", path_old, filename);
-                    // println!("old_path: {}", old_path);
                     if let Some(sig) = metastore.get::<Signature>(&old_path) {
                         /* valid entry, put it back with the modified path */
                         /* pathing stuff really should be accomplished using `Path`s,
                             but I was completely unaware of them until too late */
                         metastore.rem(&old_path);
                         metastore.set(&format!("{}/{}", path, filename), &sig);
-                        // println!("new entry: {:?}", format!("{}{}", path, filename));
                     }
                 }
             }

@@ -14,17 +14,14 @@ use indexer::*;
 
 use lazy_static::{lazy_static};
 use serde::{Serialize, Deserialize};
-use std::{env, thread, time, fs, string::String, collections::HashMap, collections::HashSet};
+use std::{env, thread, time, string::String};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use my_notify::*;
-use my_rustsync::*;
 use rusoto_core::{Region};
 use rusoto_sqs::{Sqs, SqsClient, ListQueueTagsRequest, CreateQueueRequest, DeleteMessageBatchRequest,
-                 DeleteMessageBatchRequestEntry, ReceiveMessageRequest, SendMessageRequest, ReceiveMessageResult, Message};
-use rusoto_s3::{S3, S3Client, HeadBucketRequest, PutObjectRequest, GetObjectRequest, StreamingBody};
-use std::io::prelude::*;
-use tokio::io;
-use std::sync::{Arc, RwLock, Mutex};
+                 DeleteMessageBatchRequestEntry, ReceiveMessageRequest, ReceiveMessageResult};
+use rusoto_s3::{S3, S3Client, HeadBucketRequest};
+use std::sync::{Arc, Mutex};
 use pickledb::{PickleDb, PickleDbDumpPolicy};
 use walkdir::WalkDir;
 use crossbeam::crossbeam_channel::unbounded;
@@ -217,7 +214,7 @@ async fn main() {
         /* try to receive messages from the sync server before handling local events */
         let event_msgs = receive_messages(&sqs, sqs_request.clone()).await;
         for event_msg in event_msgs {
-            // handle_event_message(&event_msg, &mut metastore, &mut watcher, &s3).await;
+            handle_event_message(&event_msg, &mut metastore, &mut watcher, &s3).await;
         }
 
         /* fetch a file event, don't block if no events */

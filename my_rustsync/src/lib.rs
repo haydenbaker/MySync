@@ -664,7 +664,7 @@ fn my_matches(st: &mut MyState, sig: &Signature, block: &[u8], hash: &adler32::R
             b.finalize()
         };
 
-        if let Some(&index) = h.get(blake2.as_bytes()) {
+        if h.get(blake2.as_bytes()).is_some() {
             // Matching hash found! If we have non-matching
             // material before the match, add it.
             if !st.pending.is_empty() {

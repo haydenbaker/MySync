@@ -1,5 +1,4 @@
 use std::{string::String, collections::HashSet};
-use std::sync::{Arc, RwLock};
 use std::sync::mpsc::{Sender};
 use my_notify::{DebouncedEvent};
 use crossbeam::crossbeam_channel::{Receiver};
