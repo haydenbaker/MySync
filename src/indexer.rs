@@ -42,8 +42,9 @@ pub async fn fullsync(metastore: &mut PickleDb, s3: &S3Client, sqs: &SqsClient, 
         let event_msgs = receive_messages(&sqs, req.clone()).await;
         for event_msg in event_msgs {
             match &event_msg.e.unwrap() {
-                Event::Write(f) => {
+                Event::Write(filename) => {
                     /* sync the file! */
+                    let f = format!("{}{}", CFG.sync_dir, filename);
                     match &event_msg.d {
                         Some(d) => {
                             apply_file_write(&f, &d, metastore, s3).await;
