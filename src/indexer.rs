@@ -1,6 +1,6 @@
 use pickledb::{PickleDb};
 use rusoto_s3::{S3, S3Client, PutObjectRequest, GetObjectRequest};
-use rusoto_sqs::{Sqs, SqsClient, SendMessageRequest};
+use rusoto_sqs::{Sqs, SqsClient, SendMessageRequest, ReceiveMessageRequest};
 use my_rustsync::*;
 use std::{path::Path, fs, fs::File, string::String, collections::HashMap};
 use tokio::io;
@@ -13,45 +13,122 @@ use crate::event::*;
 use crate::log::*;
 use crate::CHUNK_SIZE;
 use crate::CFG;
+use crate::receive_messages;
 use my_rustsync::BLAKE2_SIZE;
 
-pub fn resync_dir(path: &str, metastore: &PickleDb) -> Result<()> {
-    match fs::read_dir(path) {
-        Ok(ents) => {
-            for opt_ent in ents {
-                if let Ok(ent) = opt_ent {
-                    let entry_path = ent.path();
-                    let path_str = entry_path.clone().into_os_string().into_string().unwrap();
-                    if entry_path.is_dir() {
-                        /* recurse on a dir */
-                        resync_dir(&path_str, metastore);
-                    } else {
-                        /* ent is a file, so we must resync the file...
-                            new files are ignored, files with entries in the metastore must be reset */
-                        resync_file(&path_str, metastore);
-                    }
-                }
-            }
-        },
+pub async fn fullsync(metastore: &mut PickleDb, s3: &S3Client, sqs: &SqsClient, req: ReceiveMessageRequest) -> Option<()> {
+    /* client will request a sync from the sync server, and sync until
+        it has received confirmation that the client is fully sync'd */
+    /* client must send sync event message first */
+    let request = SendMessageRequest {
+        message_body: serde_json::to_string(&EventMessage {
+            c: Some(String::from(&CFG.client_id)),
+            e: Some(Event::Synchronize(true)),
+            d: None,
+        }).unwrap(),                                   
+        message_group_id: Some(CFG.client_id.to_string()),
+        queue_url: CFG.sqs_downstream.clone(),
+        ..Default::default()
+    };
+    match sqs.send_message(request).await {
+        Ok(res) => log(LogLevel::Debug, &format!("Synchronization request ({}) sent, awaiting response...", res.message_id.unwrap())),
         Err(e) => {
-            log(LogLevel::Critical, &format!("Could not read directory {} :: {}", path, e));
+            log(LogLevel::Critical, &format!("Could not send synchronization request, cannot proceed... :: {}", e));
+            return None
         }
+    }
+
+    'outer: loop {
+        let event_msgs = receive_messages(&sqs, req.clone()).await;
+        for event_msg in event_msgs {
+            match &event_msg.e.unwrap() {
+                Event::Write(f) => {
+                    /* sync the file! */
+                    match &event_msg.d {
+                        Some(d) => {
+                            apply_file_write(&f, &d, metastore, s3).await;
+                        },
+                        None => {
+                            log(LogLevel::Critical, &format!("Received file ({}) create, but no chunks!", f));
+                        }
+                    }
+                },
+                Event::Synchronize(_) => {
+                    /* synchronization is done! */
+                    break 'outer;
+                },
+                _ => {
+                    log(LogLevel::Warning, &format!("Received invalid synchronization event"));
+                },
+            }
+        }
+    }
+    Some(())
+}
+
+pub async fn resync(metastore: &PickleDb, s3: &S3Client) -> Result<()> {
+    /* iterate over every entry in the metastore, new files on disk that were
+        created won't be "resync'd", simply because they were never created in the eyes
+        of the client (and they'll be sync'd upon next time they are modified) */
+    for path in metastore.get_all() {
+        resync_file(&path, metastore, s3).await;
     }
     Ok(())
 }
 
-pub fn resync_file(path: &str, metastore: &PickleDb) -> Result<()> {
+pub async fn resync_file(path: &str, metastore: &PickleDb, s3: &S3Client) -> Result<()> {
+    let mut block_map: HashMap<u32, Vec<u8>> = HashMap::new();
     match metastore.get::<Signature>(path) {
         Some(sig) => {
             /* sig is the last known signature for the file */
-            match fs::metadata(path) {
-                Ok(_) => {
+            match fs::read(path) {
+                Ok(source) => {
                     /* file exists, must compare signature, and restore if differ */
+                    let mut mod_sig = signature(&source[..], vec![0; CHUNK_SIZE]).unwrap();
+                    if sig != mod_sig {
+                        /* sig not match, handle discrepancies by iterating through entire ms-sig,
+                            and cross-referencing the chunks */
+                        log(LogLevel::Warning, &format!("Resyncing from disk for file ({})", path));
+                        if let Ok(mut file) = fs::OpenOptions::new().write(true).create(true).open(path) {
+                            for chunk_id in sig.chunks.keys() {
+                                for offset in sig.chunks.get(chunk_id).unwrap().values().next().unwrap() {
+                                    file.seek(std::io::SeekFrom::Start(*offset as u64));
+                                    /* get the chunk offsets from source if it has them, otherwise s3 */
+                                    match mod_sig.chunks.get(chunk_id) {
+                                        Some(b2b) => {
+                                            /* chunk is present in modified file */
+                                            let offset_u = b2b.values().next().unwrap().first().unwrap();
+                                            write_chunk_from_source(path, *chunk_id, *offset_u, *offset, &mut file, &mut mod_sig, &source, false);
+                                        },
+                                        None => {
+                                            /* get it from s3 */
+                                            write_chunk_from_s3(path, *chunk_id, *offset, &mut file, &mut mod_sig, &mut block_map, &s3, false).await;
+                                        }
+                                    }
+                                }
+                            }
+                            log(LogLevel::Debug, &format!("File ({}) has been resync'd with the metastore", path));
+                        } else {
+                            log(LogLevel::Critical, &format!("Could not open file ({}) for writing to resync", path));
+                        }
+                    }
                     Ok(())
                 },
                 Err(e) => {
-                    /* file isn't on disk, have to restore it*/
-                    // log(LogLevel::Warning, &format!("Unable to "))
+                    /* file isn't on disk, have to restore it via s3 */
+                    log(LogLevel::Warning, &format!("Unable to restore from disk for file ({}), must resync from storage :: {}", path, e));
+                    if let Ok(mut file) = fs::OpenOptions::new().write(true).create(true).open(path) {
+                        for chunk_id in sig.chunks.keys() {
+                            for offset in sig.chunks.get(chunk_id).unwrap().values().next().unwrap() {
+                                file.seek(std::io::SeekFrom::Start(*offset as u64));
+                                write_chunk_from_s3(path, *chunk_id, *offset, &mut file, &mut Signature { window: 0, chunks: HashMap::new() },
+                                     &mut block_map, &s3, false).await;
+                            }
+                        }
+                        log(LogLevel::Debug, &format!("File ({}) has been resync'd with the metastore", path));
+                    } else {
+                        log(LogLevel::Critical, &format!("Could not open file ({}) for writing to resync", path));
+                    }
                     Ok(())
                 }
             }
@@ -151,6 +228,9 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
             /* remove f from the metastore, or do nothing if not there */
             metastore.rem(&f).unwrap();
         },
+        _ => {
+            /* this is where we could re-sync a client if the sync server determined it was inconsistent */
+        },
     }
 }
 
@@ -202,7 +282,8 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                         /* check if chunks exists on s3 already */
                         // validate_chunk(k)
                         /* chunk not present, so upload the chunk data using offset (in 'v') from signature */
-                        let offset : usize = *v.values().next().unwrap();
+                        /* TODO: CHANGE HERE FOR OFFLINE EDITS */
+                        let offset : usize = *v.values().next().unwrap().first().unwrap();
                         let offset_end : usize = if offset + CHUNK_SIZE <= source.len() { offset + CHUNK_SIZE } else { source.len() };
                         /* Really should compress chunk before sending to S3 */
                         match s3.put_object(PutObjectRequest {
@@ -240,7 +321,7 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                     for (k, v) in source_sig.chunks.iter() {
                         /* check if chunks exists on s3 already */
                         // validate_chunk(k)
-                        let offset : usize = *v.values().next().unwrap();
+                        let offset : usize = *v.values().next().unwrap().first().unwrap();
                         let offset_end : usize = if offset + CHUNK_SIZE <= source.len() { offset + CHUNK_SIZE } else { source.len() };
                         match s3.put_object(PutObjectRequest {
                             bucket: String::from(&CFG.s3_bucket),
@@ -307,7 +388,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
                     apply_file_write(&f, &d, metastore, s3).await;
                 },
                 None => {
-                    // log
+                    return log(LogLevel::Critical, &format!("Received file ({}) create, but no chunks!", f));
                 }
             }
             /* re-add file to watcher */
@@ -378,36 +459,47 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             }
             unblacklist_file(&f, watcher);
         },
-        None => {}
+        _ => {}
     }
 }
 
-fn write_chunk_from_source(path: &str, id: u32, offset_u: usize, offset: usize, file: &mut File, sig: &mut Signature, source: &[u8]) -> usize {
+fn write_chunk_from_source(path: &str, id: u32, offset_u: usize, offset: usize, file: &mut File,
+     sig: &mut Signature, source: &[u8], modify_sig: bool) -> usize {
     let offset_end: usize = if offset_u + CHUNK_SIZE <= source.len() { offset_u + CHUNK_SIZE } else { source.len() };
     if let Err(e) = file.write_all(&source[offset_u..offset_end]) {
         log(LogLevel::Critical, &format!("Could not write from Source ({}..{}) from s3 for file ({}) :: {}",
                 offset_u, offset_end, path, e));
         return 0
     }
-    /* add to the new signature */
-    let mut blake2 = [0; BLAKE2_SIZE];
-    blake2.clone_from_slice(blake2_rfc::blake2b::blake2b(BLAKE2_SIZE, &[],
-                                &source[offset_u..offset_end]).as_bytes());
-    sig.chunks.entry(id)
-                    .or_insert(HashMap::new())
-                    .insert(Blake2b(blake2), offset);
+    if modify_sig {
+        /* add to the new signature */
+        let mut blake2 = [0; BLAKE2_SIZE];
+        blake2.clone_from_slice(blake2_rfc::blake2b::blake2b(BLAKE2_SIZE, &[],
+                                    &source[offset_u..offset_end]).as_bytes());
+        sig.chunks.entry(id)
+                        .or_insert(HashMap::new())
+                        .entry(Blake2b(blake2))
+                        .or_insert(Vec::new())
+                        .push(offset);
+    }
     offset_end - offset_u
 }
 
 async fn write_chunk_from_s3(path: &str, id: u32, offset: usize, file: &mut File, sig: &mut Signature,
-     block_map: &mut HashMap<u32, Vec<u8>>, s3: &S3Client) -> usize {
+     block_map: &mut HashMap<u32, Vec<u8>>, s3: &S3Client, modify_sig: bool) -> usize {
     /* chunk must be retrieved from S3... ideally, there would be a local chunk
         mapping which would allow reading chunks from other files (if they are present)
         instead of making requests to S3 (much faster) */
     /* This is also where I will cache chunks */
     if let Some(buf) = block_map.get(&id) {
         if let Err(e) = file.write_all(&buf) {
-            return log(LogLevel::Critical, &format!("Could not write all to file ({}) :: {}", path, e));
+            log(LogLevel::Critical, &format!("Could not write all to file ({}) :: {}", path, e));
+            return 0
+        }
+        if modify_sig {
+            sig.chunks.get_mut(&id).unwrap()
+                .values_mut().next().unwrap()
+                .push(offset);
         }
         buf.len();
     }
@@ -427,13 +519,17 @@ async fn write_chunk_from_s3(path: &str, id: u32, offset: usize, file: &mut File
             }
             /* cache the block in case it's used again later  */
             block_map.insert(id, block_buf.clone());
-            /* add to the new signature */
-            let mut blake2 = [0; BLAKE2_SIZE];
-            blake2.clone_from_slice(blake2_rfc::blake2b::blake2b(BLAKE2_SIZE, &[],
-                                    &block_buf).as_bytes());
-            sig.chunks.entry(id)
-                            .or_insert(HashMap::new())
-                            .insert(Blake2b(blake2), offset);
+            if modify_sig {
+                /* add to the new signature */
+                let mut blake2 = [0; BLAKE2_SIZE];
+                blake2.clone_from_slice(blake2_rfc::blake2b::blake2b(BLAKE2_SIZE, &[],
+                                        &block_buf).as_bytes());
+                sig.chunks.entry(id)
+                    .or_insert(HashMap::new())
+                    .entry(Blake2b(blake2))
+                    .or_insert(Vec::new())
+                    .push(offset);
+            }
             cnt
         }
         Err(e) => {
@@ -467,11 +563,11 @@ pub async fn apply_file_write(path: &str, delta: &MyDelta, metastore: &mut Pickl
                                     /* retrieved is a hashmap ({b2b -> offset}) */
                                     Some(cidx) => {
                                         /* since the chunk is present, there will be an offset for it */
-                                        let offset_u = *cidx.values().next().unwrap();
-                                        i += write_chunk_from_source(path, *chunk_id, offset_u, i, &mut file, &mut new_sig, &source);
+                                        let offset_u = *cidx.values().next().unwrap().first().unwrap();
+                                        i += write_chunk_from_source(path, *chunk_id, offset_u, i, &mut file, &mut new_sig, &source, true);
                                     },
                                     None => {
-                                        i += write_chunk_from_s3(path, *chunk_id, i, &mut file, &mut new_sig, &mut block_map, s3).await;
+                                        i += write_chunk_from_s3(path, *chunk_id, i, &mut file, &mut new_sig, &mut block_map, s3, true).await;
                                     }
                                 };
                             }     
@@ -497,7 +593,7 @@ pub async fn apply_file_write(path: &str, delta: &MyDelta, metastore: &mut Pickl
                     log(LogLevel::Debug, &format!("Creating new file ({})", path));
                     // log(LogLevel::Critical, &format!("Could not open file ({}) for reading :: {}", path, e));
                     for chunk_id in &delta.blocks {
-                        i += write_chunk_from_s3(path, *chunk_id, i, &mut file, &mut new_sig, &mut block_map, s3).await;
+                        i += write_chunk_from_s3(path, *chunk_id, i, &mut file, &mut new_sig, &mut block_map, s3, true).await;
                     }
                 },
                 Err(e) => {

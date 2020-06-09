@@ -5,7 +5,8 @@ use my_rustsync::*;
 pub enum Event {
     Write(String),
     Rename(String, String),
-    Remove(String)
+    Remove(String),
+    Synchronize(bool)
 }
 
 /* struct to serialize to send via sqs */

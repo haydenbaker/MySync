@@ -84,7 +84,7 @@ async fn main() {
     env::set_var("AWS_ACCESS_KEY_ID", &CFG.aws_access_key_id);
     env::set_var("AWS_SECRET_ACCESS_KEY", &CFG.aws_secret_access_key);
 
-    log(LogLevel::Info, "MySync-client Starting up...");
+    log(LogLevel::Info, "MySync-client starting up...");
 
     /* A "pause" lock for use by the indexer to halt the watcher */
     let pause: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -96,10 +96,6 @@ async fn main() {
     let (notify_tx, notify_rx) = unbounded();
     let mut watcher = watcher(notify_tx.clone(), time::Duration::from_millis(5000)).unwrap();
 
-    for entry in WalkDir::new(&CFG.sync_dir) {
-        // println!("entry: {}", &entry.unwrap().path().display());
-        watcher.watch(entry.unwrap().path(), RecursiveMode::NonRecursive).unwrap();
-    }
     /* spawn the watcher thread */
     thread::spawn(move || {
         /* thread gets access to variables from outer scope */
@@ -142,6 +138,7 @@ async fn main() {
     /* Need a kv "store" to link filename to signature,
         we start it up here... */
     // let metastore: HashMap<String, Signature> = HashMap::new();
+    let mut full_sync = false;
     let mut metastore;
     match PickleDb::load_bin("test.db", PickleDbDumpPolicy::PeriodicDump(time::Duration::from_secs(5))) {
         Ok(db) => {
@@ -150,11 +147,11 @@ async fn main() {
         Err(_) => {
             log(LogLevel::Info, "Pre-existing db not found, creating new db...");
             metastore = PickleDb::new_bin("test.db", PickleDbDumpPolicy::AutoDump);
+            full_sync = true;
         }
     }
     /* resync all the stuff on disk according to the metastore,
         This is where we would do so if we had the right data format */
-    // resync_disk(&metastore);
 
     /* connect to s3 */
     let s3 = S3Client::new(Region::UsEast1);
@@ -202,11 +199,30 @@ async fn main() {
         max_number_of_messages: Some(10),
         ..Default::default()
     };
+
+    /* if this is a new client, it needs to be fully sync'd */
+    // if full_sync {
+        log(LogLevel::Info, "Performing full synchronization for new client...");
+        if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
+            panic!("Cannot proceed without being synchronized...")
+        }
+        log(LogLevel::Info, "Done syncing...");
+    // } else {
+        /* resync everything in the folder if there is a discrepancy */
+        log(LogLevel::Info, "Checking files to resync between metastore and disk...");
+        resync(&metastore, &s3).await;
+        log(LogLevel::Info, "Done resyncing...");
+
+    // }
     
+    for entry in WalkDir::new(&CFG.sync_dir) {
+        // println!("entry: {}", &entry.unwrap().path().display());
+        watcher.watch(entry.unwrap().path(), RecursiveMode::NonRecursive).unwrap();
+    }
     /* can unlock the pause lock so that watcher may resume */
     std::mem::drop(pause_guard);
+    log(LogLevel::Info, "MySync-client ready...");
 
-    // let block_buf = vec![0; CHUNK_SIZE];
     /* main indexer event loop */
     loop {
         // thread::sleep(time::Duration::from_secs(5));
@@ -272,13 +288,9 @@ async fn receive_messages(sqs: &SqsClient, req: ReceiveMessageRequest) -> Vec<Ev
                 ems.clear();
             }
         },
-        /* This handles the case of an http dispatch error (occuring usually after a reconnect)*/
-        Ok(Err(e)) => {
-            println!("Ok(e): {:?}", e);
-        },
         /* This is a timeout from the recv request (dropped connection) */
         Err(e) => {
-            println!("e: {:?}", e);
+            log(LogLevel::Warning, &format!("Failed to receive messages :: {}", e));
         },
         /* This is when request is successful, but no messages recv'd */
         _ => ()

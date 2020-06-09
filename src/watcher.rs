@@ -89,18 +89,3 @@ fn filter_path(path: String) -> Option<String> {
         None => None
     }
 }
-
-fn check_blacklist(f: Option<String>, fb: &HashSet<String>) -> (Option<String>, bool) {
-    match f {
-        /* only check list if f is a valid path */
-        Some(x) => {
-            match fb.get(&x) {
-                /* f is on the blacklist */
-                Some(y) => (Some(x), true),
-                /* f is not on the blacklist */
-                None => (Some(x), false)
-            }
-        },
-        None => (None, false)
-    }
-}

@@ -15,7 +15,8 @@ use my_rustsync::*;
 use rusoto_core::{Region};
 use rusoto_sqs::{Sqs, SqsClient, ListQueuesRequest, CreateQueueRequest, DeleteMessageBatchRequest,
                  DeleteMessageBatchRequestEntry, ReceiveMessageRequest, SendMessageRequest, ReceiveMessageResult, Message};
-use rusoto_dynamodb::{DynamoDb, DynamoDbClient, ListTablesInput, PutItemInput, AttributeValue, DeleteItemInput};
+use rusoto_dynamodb::{DynamoDb, DynamoDbClient, ListTablesInput, PutItemInput, AttributeValue,
+                 DeleteItemInput, ScanInput};
 use std::io::prelude::*;
 use tokio::io;
 use std::sync::{Arc, RwLock, Mutex};
@@ -42,7 +43,8 @@ struct ServerConfig {
     aws_access_key_id: String,
     aws_secret_access_key: String,
     s3_bucket: String,
-    sqs_downstream: String
+    sqs_downstream: String,
+    sqs_prefix: String
 }
 
 /* default configuration for client - '~/.config/sync-client' */
@@ -52,7 +54,8 @@ impl ::std::default::Default for ServerConfig {
         aws_access_key_id: "".to_string(),
         aws_secret_access_key: "".to_string(),
         s3_bucket: "".to_string(),
-        sqs_downstream: "".to_string() } }
+        sqs_downstream: "".to_string(),
+        sqs_prefix: "".to_string() } }
 }
 
 /* lazy_static is a useful way of declaring "runtime" statics */
@@ -75,7 +78,7 @@ async fn main() {
     env::set_var("AWS_ACCESS_KEY_ID", &CFG.aws_access_key_id);
     env::set_var("AWS_SECRET_ACCESS_KEY", &CFG.aws_secret_access_key);
 
-    log(LogLevel::Info, "MySync-Server Starting up...");
+    log(LogLevel::Info, "MySync-Server starting up...");
 
     /* for iterating over to broadcast */
     let mut clientstore: Vec<(String, String)> = Vec::new();
@@ -129,6 +132,7 @@ async fn main() {
         }
     }
 
+    log(LogLevel::Info, "MySync-Server ready...");
 
     // let block_buf = vec![0; CHUNK_SIZE];
     /* main indexer event loop */
@@ -139,7 +143,7 @@ async fn main() {
         let event_msgs = receive_messages(&sqs, sqs_request.clone()).await;
         for event_msg in event_msgs {
             println!("em: {:?}", event_msg);
-            handle_event_message(&event_msg, &clientstore, &sqs, &db).await;
+            handle_event_message(&event_msg, &mut clientstore, &sqs, &db).await;
         }
     }
 }
@@ -194,98 +198,176 @@ async fn receive_messages(sqs: &SqsClient, req: ReceiveMessageRequest) -> Vec<Ev
     ems
 }
 
-async fn handle_event_message(em: &EventMessage, cs: &Vec<(String, String)>, sqs: &SqsClient, db: &DynamoDbClient) {
+async fn handle_event_message(em: &EventMessage, cs: &mut Vec<(String, String)>, sqs: &SqsClient, db: &DynamoDbClient) {
     /* the server's responsibility is to basically forward client messages to eachother,
         and to a greater extent, do some more complex synchronization behaviors, but I most likely
         won't be able to get those done, oh well... */
     /* have to send a message to each client that isn't the originator */
     let (eme, emc) = (em.e.as_ref().unwrap(), em.c.as_ref().unwrap());
     /* persist the event's change in the database */
-    handle_event(eme, &em.d, db).await;
-
-    for (client_id, client_q) in cs {
-        if *client_id != *emc {
-            let request = SendMessageRequest {
-                message_body: serde_json::to_string(&em).unwrap(),
-                message_group_id: Some(String::from("sync")),
-                queue_url: String::from(client_q),
-                ..Default::default()
-            };
-            match sqs.send_message(request).await {
-                Ok(res) => log(LogLevel::Debug, &format!("Event ({:?}) from client ({}) succesfully sent upstream to client ({})",
-                                                        eme, emc, client_id)),
-                Err(e) => log(LogLevel::Critical, &format!("Event ({:?}) from client ({}) failed to send upstream to client ({})",
-                                                        eme, emc, client_id))
+    handle_event(em, cs, db, sqs).await;
+    if let Event::Synchronize(_) = eme {
+        /* synchronization messages shouldn't be broadcasted to other clients,
+            this is an area where we could do something else (nothing for now) */
+    } else {
+        /* broadcast the message to other clients */
+        for (client_id, client_q) in cs {
+            if *client_id != *em.c.as_ref().unwrap() {
+                let request = SendMessageRequest {
+                    message_body: serde_json::to_string(&em).unwrap(),
+                    message_group_id: Some(String::from("sync")),
+                    queue_url: client_q.clone(),
+                    ..Default::default()
+                };
+                match sqs.send_message(request).await {
+                    Ok(res) => log(LogLevel::Debug, &format!("Event ({:?}) from client ({}) succesfully sent upstream to client ({})",
+                                                            *em.e.as_ref().unwrap(), *em.c.as_ref().unwrap(), client_id)),
+                    Err(e) => log(LogLevel::Critical, &format!("Event ({:?}) from client ({}) failed to send upstream to client ({})",
+                                                            *em.e.as_ref().unwrap(), *em.c.as_ref().unwrap(), client_id))
+                }
             }
         }
     }
 }
 
-async fn handle_event(e: &Event, d: &Option<MyDelta>, db: &DynamoDbClient) {
-    match e {
-        /* put the entry (f) with chunk ordering (f) in the database */
-        Event::Write(f) => {
-            if let Some(delta) = d {
-                let chunks: Vec<String> = delta.blocks.clone().into_iter().map(|x| x.to_string()).collect();
-                let mut req = PutItemInput {
+async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &DynamoDbClient, sqs: &SqsClient) {
+    if let (Some(e), d) = (em.e.as_ref(), em.d.as_ref()) {
+        match e {
+            /* put the entry (f) with chunk ordering (f) in the database */
+            Event::Write(f) => {
+                if let Some(delta) = d {
+                    let chunks: Vec<String> = delta.blocks.clone().into_iter().map(|x| x.to_string()).collect();
+                    let mut req = PutItemInput {
+                        table_name: "file".to_string(),
+                        item: hashmap![
+                            "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()},
+                            "chunks".to_string() => AttributeValue { ns: Some(chunks), ..Default::default()}
+                        ],
+                        ..Default::default()
+                    };
+                    match db.put_item(req).await {
+                        Ok(res) => log(LogLevel::Debug, &format!("Successfully insert item ({}) into database", &f)),
+                        Err(e) => log(LogLevel::Critical, &format!("Could not update database for Event::Create({}) :: {}", &f, e))
+                    }                
+                }
+            },
+            /* have to replace the old entry (f) with the new entry (t) in the databse */
+            Event::Rename(f, t) => {
+                /* However, this must be done by creating t and then remove f, and
+                    technically, this should also be a "transaction" in a traditional sense */
+                let mut req = DeleteItemInput {
                     table_name: "file".to_string(),
-                    item: hashmap![
-                        "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()},
-                        "chunks".to_string() => AttributeValue { ns: Some(chunks), ..Default::default()}
+                    key: hashmap![
+                        "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()}
                     ],
+                    return_values: Some("ALL_OLD".to_string()),
                     ..Default::default()
                 };
-                db.put_item(req).await;
-            }
-        },
-        /* have to replace the old entry (f) with the new entry (t) in the databse */
-        Event::Rename(f, t) => {
-            /* However, this must be done by creating t and then remove f, and
-                technically, this should also be a "transaction" in a traditional sense */
-            let mut req = DeleteItemInput {
-                table_name: "file".to_string(),
-                key: hashmap![
-                    "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()}
-                ],
-                return_values: Some("ALL_OLD".to_string()),
-                ..Default::default()
-            };
-            match db.delete_item(req).await {
-                Ok(item) => {
-                    /* get the chunks and insert them for the entry (t) */
-                    if let Some(attr) = item.attributes {
-                        if let Some(attr_val) = attr.get("chunks") {
-                            let mut req = PutItemInput {
-                                table_name: "file".to_string(),
-                                item: hashmap![
-                                    "path".to_string() => AttributeValue { s: Some(t.to_string()), ..Default::default()},
-                                    "chunks".to_string() => AttributeValue { ns: attr_val.ns.clone(), ..Default::default()}
-                                ],
-                                ..Default::default()
-                            };
-                            db.put_item(req).await;
+                match db.delete_item(req).await {
+                    Ok(item) => {
+                        /* get the chunks and insert them for the entry (t) */
+                        if let Some(attr) = item.attributes {
+                            if let Some(attr_val) = attr.get("chunks") {
+                                let mut req = PutItemInput {
+                                    table_name: "file".to_string(),
+                                    item: hashmap![
+                                        "path".to_string() => AttributeValue { s: Some(t.to_string()), ..Default::default()},
+                                        "chunks".to_string() => AttributeValue { ns: attr_val.ns.clone(), ..Default::default()}
+                                    ],
+                                    ..Default::default()
+                                };
+                                match db.put_item(req).await {
+                                    Ok(res) => log(LogLevel::Debug, &format!("Successfully insert item ({}) into database", &t)),
+                                    Err(e) => log(LogLevel::Critical, &format!("Failed to insert item ({}) from database :: {}", &t, e))
+                                }
+                            }
+                        } else {
+                            log(LogLevel::Warning, &format!("Item ({}) did not contain any attributes...", &f))
                         }
-                    } else {
-
+                    },
+                    Err(e) => {
+                        /* the request failed, log it */
+                        log(LogLevel::Critical, &format!("Could not update database for Event::Rename({} -> {}) :: {}", f, t, e));
                     }
-                },
-                Err(e) => {
-                    /* the request failed, log it */
-                    log(LogLevel::Critical, &format!("Could not update database for Event::Rename({} -> {}) :: {}", f, t, e));
+                }
+            },
+            /* get rid of the entry (f) in the database */
+            Event::Remove(f) => {
+                let mut req = DeleteItemInput {
+                    table_name: "file".to_string(),
+                    key: hashmap![
+                        "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()}
+                    ],
+                    return_values: Some("ALL_OLD".to_string()),
+                    ..Default::default()
+                };
+                match db.delete_item(req).await {
+                    Ok(res) => log(LogLevel::Debug, &format!("Successfully deleted item ({}) from database", &f)),
+                    Err(e) => log(LogLevel::Critical, &format!("Could not update database for Event::Remove({}) :: {}", &f, e))
+                }
+            },
+            /* a synchronization event, we must sync the client */
+            Event::Synchronize(_) => {
+                /* get all of the records from the database, this is probably something that could
+                     be cached within the sync server and updated alongside the database */
+                let client_id = em.c.as_ref().unwrap();
+                let client_q = format!("{}/sync-upstream-{}.fifo", &CFG.sqs_prefix, client_id);
+                cs.push((client_id.to_string(), client_q.clone()));
+                let mut request = SendMessageRequest {
+                message_body: "".to_string(),
+                message_group_id: Some(String::from("sync")),
+                queue_url: client_q.clone(),
+                ..Default::default()
+                };
+                let mut sync_em = EventMessage { 
+                    c: Some("sync".to_string()),
+                    e: None,
+                    d: None,
+                };
+                let mut req = ScanInput { table_name: "file".to_string(), ..Default::default() };
+                loop {
+                    match db.scan(req.clone()).await {
+                        Ok(res) => {
+                            println!("res: {:?}", res);
+                            /* forward write events to the client */
+
+                            for item in res.items.unwrap_or(Vec::new()) {
+                                sync_em.e = Some(Event::Write(String::from(item.get("path").unwrap().s.as_ref().unwrap())));
+                                sync_em.d = Some(MyDelta {
+                                    blocks: item.get("chunks").unwrap().ns.as_ref().unwrap().into_iter().map(|x| x.parse::<u32>().unwrap()).collect(),
+                                    window: CHUNK_SIZE,
+                                });
+                                request.message_body = serde_json::to_string(&sync_em).unwrap();
+                                /* this should be a batched message request, but... yeah */
+                                match sqs.send_message(request.clone()).await {
+                                    Ok(res) => log(LogLevel::Debug, &format!("Sync event ({:?}) successfully sent upstream to client ({})",
+                                                                             &sync_em.e, client_id)),
+                                    Err(e) => log(LogLevel::Critical, &format!("Sync event ({:?}) failed to send to client ({}) :: {}",
+                                                                             &sync_em.e, client_id, e))
+                                }
+                            }
+                            /* continue scanning using the continuation key, no key means done */
+                            if let Some(key) = res.last_evaluated_key {
+                                req.exclusive_start_key = Some(key);
+                            } else {
+                                /* nothing more to sync, we're done with this event */
+                                return;
+                            }
+                        },
+                        Err(e) => log(LogLevel::Critical, &format!("Could not scan database for synchronizing client ({}) :: {}", client_id, e)),                   
+                    }
+                }
+                /* sync'ing is completely down, send a confirmation! */
+                sync_em.e = Some(Event::Synchronize(true));
+                request.message_body = serde_json::to_string(&sync_em).unwrap();
+                /* this should be a batched message request, but... yeah */
+                match sqs.send_message(request).await {
+                    Ok(res) => log(LogLevel::Debug, &format!("Sync event ({:?}) successfully sent upstream to client ({})",
+                                                                &sync_em.e, client_id)),
+                    Err(e) => log(LogLevel::Critical, &format!("Sync event ({:?}) failed to send to client ({}) :: {}",
+                                                                &sync_em.e, client_id, e))
                 }
             }
-        },
-        /* get rid of the entry (f) in the database */
-        Event::Remove(f) => {
-            let mut req = DeleteItemInput {
-                table_name: "file".to_string(),
-                key: hashmap![
-                    "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()}
-                ],
-                return_values: Some("ALL_OLD".to_string()),
-                ..Default::default()
-            };
-            println!("res: {:?}", db.delete_item(req).await);
-        }
-    }    
+        }    
+    }
 }
