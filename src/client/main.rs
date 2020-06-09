@@ -203,9 +203,9 @@ async fn main() {
     /* if this is a new client, it needs to be fully sync'd */
     // if full_sync {
         log(LogLevel::Info, "Performing full synchronization for new client...");
-        if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
-            panic!("Cannot proceed without being synchronized...")
-        }
+        // if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
+        //     panic!("Cannot proceed without being synchronized...")
+        // }
         log(LogLevel::Info, "Done syncing...");
     // } else {
         /* resync everything in the folder if there is a discrepancy */
@@ -284,7 +284,6 @@ async fn receive_messages(sqs: &SqsClient, req: ReceiveMessageRequest) -> Vec<Ev
             if let Err(e) = sqs.delete_message_batch(req).await {
                 /* couldn't delete messages, drop the event msgs!
                     (otherwise we would receive them again) */
-                println!("{:?}", e);
                 ems.clear();
             }
         },

@@ -167,7 +167,21 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
             /* filenames for sqs message later */
             let (_, f_filename) = f.split_at(CFG.sync_dir.len());
             let (_, t_filename) = t.split_at(CFG.sync_dir.len());
-
+            match fs::metadata(&t) {
+                Ok(md) => {
+                    if md.is_dir() {
+                        /* if a dir is renamed, need to change all of the signature in metastore,
+                            but don't need to send a message for that */
+                        // handle_dir_rename(&t, &f, metastore, watcher).await;
+                    } else {
+                        // handle_file_rename(&t, &f, metastore).await;
+                    }
+                    watcher.watch(&t, RecursiveMode::NonRecursive);
+                },
+                Err(e) => {
+                    log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e))
+                }
+            }
             let sig: Signature = match metastore.get(&f) {
                 Some(f_sig) => {
                     metastore.rem(&f);
@@ -380,7 +394,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
     match &em.e {
         Some(Event::Write(filename)) => {
             /* a file write requires the most work by far */
-            let f = format!("{}{}", "/opt/sync/", filename);
+            let f = format!("{}{}", CFG.sync_dir, filename);
             /* blacklist the file */
             blacklist_file(&f, watcher);
             match &em.d {
@@ -397,8 +411,8 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
         },
         Some(Event::Rename(f_filename, t_filename)) => {
             /* re-assemble the correct file paths for each filename */
-            let f = format!("{}{}", "/opt/sync/", f_filename);
-            let t = format!("{}{}", "/opt/sync/", t_filename);
+            let f = format!("{}{}", CFG.sync_dir, f_filename);
+            let t = format!("{}{}", CFG.sync_dir, t_filename);
             /* watcher should drop events for the files until done */
             blacklist_file(&f, watcher);
             blacklist_file(&t, watcher);
@@ -426,7 +440,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
         },
         Some(Event::Remove(filename)) => {
             /* re-assemble the correct file paths for each filename */
-            let f = format!("{}{}", "/opt/sync/", filename);
+            let f = format!("{}{}", CFG.sync_dir, filename);
             /* watcher should drop events for the file until done */
             blacklist_file(&f, watcher);
             /* rename the file, */
@@ -587,7 +601,10 @@ pub async fn apply_file_write(path: &str, delta: &MyDelta, metastore: &mut Pickl
                 unfortunately, the only way with what we have is to read it again (bleh) */
         },
         Err(_) => {
-            /* there was no pre-existing file (or it couldn't be read), so the only way to retrieve chunks is s3 */
+            /* there was no pre-existing file (or it couldn't be read), so the only way to retrieve chunks is s3,
+                need to create directories if needed too */
+            let path_parent = Path::new(&path).parent().unwrap().to_str().unwrap();
+            fs::create_dir_all(path_parent);
             match fs::OpenOptions::new().write(true).create(true).open(path) {
                 Ok(mut file) => {   
                     log(LogLevel::Debug, &format!("Creating new file ({})", path));
