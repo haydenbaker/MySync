@@ -203,9 +203,9 @@ async fn main() {
     /* if this is a new client, it needs to be fully sync'd */
     // if full_sync {
         log(LogLevel::Info, "Performing full synchronization for new client...");
-        // if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
-        //     panic!("Cannot proceed without being synchronized...")
-        // }
+        if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
+            panic!("Cannot proceed without being synchronized...")
+        }
         log(LogLevel::Info, "Done syncing...");
     // } else {
         /* resync everything in the folder if there is a discrepancy */
