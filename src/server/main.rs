@@ -125,7 +125,7 @@ async fn main() {
     let db = DynamoDbClient::new(Region::UsEast1);
     match db.list_tables(ListTablesInput { ..Default::default() }).await {
         Ok(res) => {
-            println!("res: {:?}", res);
+            return log(LogLevel::Info, &format!("Successfully connected to DynamoDB"));
         },
         Err(e) => {
             return log(LogLevel::Critical, &format!("Cannot connect to DynamoDB :: {}", e));
@@ -325,7 +325,7 @@ async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &Dy
                     d: None,
                 };
                 let mut req = ScanInput { table_name: "file".to_string(), ..Default::default() };
-                loop {
+                'outer: loop {
                     match db.scan(req.clone()).await {
                         Ok(res) => {
                             println!("res: {:?}", res);
@@ -351,7 +351,7 @@ async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &Dy
                                 req.exclusive_start_key = Some(key);
                             } else {
                                 /* nothing more to sync, we're done with this event */
-                                return;
+                                break 'outer;
                             }
                         },
                         Err(e) => log(LogLevel::Critical, &format!("Could not scan database for synchronizing client ({}) :: {}", client_id, e)),                   

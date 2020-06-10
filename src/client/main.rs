@@ -201,19 +201,20 @@ async fn main() {
     };
 
     /* if this is a new client, it needs to be fully sync'd */
-    // if full_sync {
+    if full_sync {
         log(LogLevel::Info, "Performing full synchronization for new client...");
         if let None = fullsync(&mut metastore, &s3, &sqs, sqs_request.clone()).await {
+            std::fs::remove_file("test.db");
             panic!("Cannot proceed without being synchronized...")
         }
         log(LogLevel::Info, "Done syncing...");
-    // } else {
+    } else {
         /* resync everything in the folder if there is a discrepancy */
         log(LogLevel::Info, "Checking files to resync between metastore and disk...");
         resync(&metastore, &s3).await;
         log(LogLevel::Info, "Done resyncing...");
 
-    // }
+    }
     
     for entry in WalkDir::new(&CFG.sync_dir) {
         // println!("entry: {}", &entry.unwrap().path().display());
