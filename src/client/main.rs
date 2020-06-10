@@ -119,7 +119,6 @@ async fn main() {
             /* block until there is an event to be handled (nothing else to do) */
             match notify_rx.recv() {
                 Ok(event) => {
-                    println!("event: {:?}", event);
                     /* received the event, now process it */
                     handle_inotify_event(event, &tx, &notify_rx);
                 },
@@ -172,7 +171,7 @@ async fn main() {
         Ok(_) => log(LogLevel::Info, "Successfully connected to SQS (sync-downstream.fifo)"),
         Err(e) => {
             log(LogLevel::Critical, "Cannot connect to SQS (sync-downstream.fifo)");
-            panic!("{}", e)
+            panic!("{}", e);
         },
     }
 
@@ -190,7 +189,7 @@ async fn main() {
         },
         Err(e) => {
             log(LogLevel::Critical, &format!("Cannot connect to SQS ({})", format!("sync-upstream-{}.fifo", CFG.client_id)));
-            panic!("{}", e)
+            panic!("{}", e);
         },
     }
 

@@ -1,5 +1,5 @@
 use pickledb::{PickleDb};
-use rusoto_s3::{S3, S3Client, PutObjectRequest, GetObjectRequest};
+use rusoto_s3::{S3, S3Client, PutObjectRequest, GetObjectRequest, HeadObjectRequest};
 use rusoto_sqs::{Sqs, SqsClient, SendMessageRequest, ReceiveMessageRequest};
 use my_rustsync::*;
 use std::{path::Path, fs, fs::File, string::String, collections::HashMap};
@@ -141,6 +141,7 @@ pub async fn resync_file(path: &str, metastore: &PickleDb, s3: &S3Client) -> Res
     }
 }
 
+
 pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, metastore: &mut PickleDb, watcher: &mut INotifyWatcher) {
     match msg {
         /* a file or dir creation or modification */
@@ -172,10 +173,10 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                 Ok(md) => {
                     if md.is_dir() {
                         /* if a dir is renamed, need to change all of the signature in metastore,
-                            but don't need to send a message for that */
-                        // handle_dir_rename(&t, &f, metastore, watcher).await;
+                            but only need to send message for the dir rename */
+                        apply_dir_rename(&t, &f, metastore, watcher);
                     } else {
-                        // handle_file_rename(&t, &f, metastore).await;
+                        apply_file_rename(&f, &t, metastore);
                     }
                     watcher.watch(&t, RecursiveMode::NonRecursive);
                 },
@@ -183,23 +184,6 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                     log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e))
                 }
             }
-            let sig: Signature = match metastore.get(&f) {
-                Some(f_sig) => {
-                    metastore.rem(&f);
-                    f_sig
-                },
-                None => 
-                    match fs::read(&t) {
-                        Ok(source) => {
-                            /* have the signature now */
-                            signature(&source[..], vec![0; CHUNK_SIZE]).unwrap()
-                        },
-                        Err(e) => {
-                            log(LogLevel::Warning, &format!("Could not read source file ({}) :: {}", t, e));
-                            return;
-                        }
-                    }
-                };
             let request = SendMessageRequest {
                 message_body: serde_json::to_string(&EventMessage {
                     c: Some(String::from(&CFG.client_id)),
@@ -216,8 +200,6 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                 Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{} -> {}) Message failed to send :: {}",
                                                         f_filename, t_filename, e))
             }
-            /* update t in metastore (doesn't matter if t was already there, file is already gone) */
-            metastore.set(&t, &sig);
             watcher.watch(&t, RecursiveMode::NonRecursive);
         },
         /* a file or dir remove */
@@ -275,6 +257,18 @@ pub async fn handle_dir_create(path: &str, s3: &S3Client, sqs: &SqsClient, metas
     }
 }
 
+pub async fn validate_chunk(chunk_id: u32, s3: &S3Client) -> bool {
+    let request = HeadObjectRequest {
+        bucket: String::from(&CFG.s3_bucket),
+        key: chunk_id.to_string(),
+        ..Default::default()
+    };
+    if let Err(_) = s3.head_object(request).await {
+        return false
+    }
+    return true;
+}
+
 pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, metastore: &mut PickleDb) {
     /* filename for sqs message later */
     let (_, filename) = path.split_at(CFG.sync_dir.len());
@@ -295,7 +289,9 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                     /* metastore has a record already, must compare, upload if not present */
                     for (k, v) in source_sig.chunks.iter().filter(|&(k, _)| !sig.chunks.contains_key(k)) {
                         /* check if chunks exists on s3 already */
-                        // validate_chunk(k)
+                        if validate_chunk(*k, s3).await {
+                            continue;
+                        }
                         /* chunk not present, so upload the chunk data using offset (in 'v') from signature */
                         /* TODO: CHANGE HERE FOR OFFLINE EDITS */
                         let offset : usize = *v.values().next().unwrap().first().unwrap();
@@ -335,8 +331,9 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                     /* key wasn't in there, must be a new file */
                     for (k, v) in source_sig.chunks.iter() {
                         /* check if chunks exists on s3 already */
-                        // validate_chunk(k)
-                        let offset : usize = *v.values().next().unwrap().first().unwrap();
+                        if validate_chunk(*k, s3).await {
+                            continue;
+                        }                        let offset : usize = *v.values().next().unwrap().first().unwrap();
                         let offset_end : usize = if offset + CHUNK_SIZE <= source.len() { offset + CHUNK_SIZE } else { source.len() };
                         match s3.put_object(PutObjectRequest {
                             bucket: String::from(&CFG.s3_bucket),
@@ -424,7 +421,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             match fs::metadata(&t) {
                 Ok(md) => {
                     if md.is_dir() {
-                        if let Err(e) = apply_dir_rename(&t, &f, metastore) {
+                        if let Err(e) = apply_dir_rename(&t, &f, metastore, watcher) {
                             return log(LogLevel::Critical, &format!("Could not apply directory rename ({}->{}) :: {}", f, t, e));
                         }
                     } else {
@@ -647,7 +644,7 @@ pub fn apply_file_rename(path_f: &str, path_t: &str, metastore: &mut PickleDb) {
     metastore.set(&path_t, &sig);
 }
 
-pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb) -> Result<()> {
+pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb, watcher: &mut INotifyWatcher) -> Result<()> {
     match fs::read_dir(path) {
         Ok(ents) => {
             for ent in ents {
@@ -658,7 +655,7 @@ pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb) ->
                 let filename = entry_path.as_path().file_name().unwrap().to_str().unwrap();
                 if entry_path.is_dir() {
                     /* recurse on a dir */
-                    apply_dir_rename(&path_str, path_old, metastore)?;
+                    apply_dir_rename(&path_str, path_old, metastore, watcher)?;
                 } else {
                     /* remove and re-insert the updated entry! */
                     let old_path = format!("{}/{}", path_old, filename);
@@ -670,6 +667,7 @@ pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb) ->
                         metastore.set(&format!("{}/{}", path, filename), &sig);
                     }
                 }
+                watcher.watch(path, RecursiveMode::NonRecursive);
             }
         },
         Err(e) => {

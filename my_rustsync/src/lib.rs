@@ -81,7 +81,7 @@ use futures::{Async, Future, Poll};
 
 pub const BLAKE2_SIZE: usize = 32;
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Blake2b(pub [u8; BLAKE2_SIZE]);
 
 impl std::borrow::Borrow<[u8]> for Blake2b {
@@ -90,12 +90,25 @@ impl std::borrow::Borrow<[u8]> for Blake2b {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 /// The "signature" of the file, which is essentially a
 /// content-indexed description of the blocks in the file.
 pub struct Signature {
     pub window: usize,
     pub chunks: HashMap<u32, HashMap<Blake2b, Vec<usize>>>
+}
+
+impl PartialEq for Signature {
+    fn eq(&self, other: &Self) -> bool {
+        let mut filtered_self = self.chunks.clone();
+        let mut filtered_other = other.chunks.clone();
+        filtered_self.remove(&1);
+        filtered_other.remove(&1);
+
+        (self.window == other.window) &&
+        (filtered_self.len() == filtered_other.len()) &&
+        (filtered_self == filtered_other)
+    }
 }
 
 /// Create the "signature" of a file, essentially a content-indexed

@@ -125,7 +125,7 @@ async fn main() {
     let db = DynamoDbClient::new(Region::UsEast1);
     match db.list_tables(ListTablesInput { ..Default::default() }).await {
         Ok(res) => {
-            return log(LogLevel::Info, &format!("Successfully connected to DynamoDB"));
+            log(LogLevel::Info, &format!("Successfully connected to DynamoDB"));
         },
         Err(e) => {
             return log(LogLevel::Critical, &format!("Cannot connect to DynamoDB :: {}", e));
@@ -236,12 +236,14 @@ async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &Dy
             /* put the entry (f) with chunk ordering (f) in the database */
             Event::Write(f) => {
                 if let Some(delta) = d {
-                    let chunks: Vec<String> = delta.blocks.clone().into_iter().map(|x| x.to_string()).collect();
+                    let chunks: Vec<AttributeValue> = delta.blocks.clone().into_iter()
+                                            .map(|x| AttributeValue { n: Some(x.to_string()), ..Default::default() })
+                                            .collect();
                     let mut req = PutItemInput {
                         table_name: "file".to_string(),
                         item: hashmap![
                             "path".to_string() => AttributeValue { s: Some(f.to_string()), ..Default::default()},
-                            "chunks".to_string() => AttributeValue { ns: Some(chunks), ..Default::default()}
+                            "chunks".to_string() => AttributeValue { l: Some(chunks), ..Default::default()}
                         ],
                         ..Default::default()
                     };
@@ -272,7 +274,7 @@ async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &Dy
                                     table_name: "file".to_string(),
                                     item: hashmap![
                                         "path".to_string() => AttributeValue { s: Some(t.to_string()), ..Default::default()},
-                                        "chunks".to_string() => AttributeValue { ns: attr_val.ns.clone(), ..Default::default()}
+                                        "chunks".to_string() => AttributeValue { l: attr_val.l.clone(), ..Default::default()}
                                     ],
                                     ..Default::default()
                                 };
@@ -334,7 +336,8 @@ async fn handle_event(em: &EventMessage, cs: &mut Vec<(String, String)>, db: &Dy
                             for item in res.items.unwrap_or(Vec::new()) {
                                 sync_em.e = Some(Event::Write(String::from(item.get("path").unwrap().s.as_ref().unwrap())));
                                 sync_em.d = Some(MyDelta {
-                                    blocks: item.get("chunks").unwrap().ns.as_ref().unwrap().into_iter().map(|x| x.parse::<u32>().unwrap()).collect(),
+                                    blocks: item.get("chunks").unwrap().l.as_ref().unwrap().into_iter()
+                                                .map(|x| x.n.as_ref().unwrap().parse::<u32>().unwrap()).collect(),
                                     window: CHUNK_SIZE,
                                 });
                                 request.message_body = serde_json::to_string(&sync_em).unwrap();
