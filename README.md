@@ -4,6 +4,7 @@ CSC-492: Senior Project
 Hayden Baker
 
 ## Getting Started
+This README is based on an Ubuntu/Debian Development Environment, and therefore your mileage may vary if you're trying to build/run this on a different distribution... beware!
 
 ### Building
 Install Rust-Nightly  
