@@ -8,9 +8,6 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "0.2", features = ["full"] }
-# rustsync = "0.2.3"
-# notify = "4.0.15"
-# inotify = "0.8.2"
 bincode = "1.2.1"
 lazy_static = "1.4.0"
 serde = { version = "1.0", features = ["derive"] }

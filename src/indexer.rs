@@ -196,7 +196,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
             match sqs.send_message(request).await {
                 Ok(res) => log(LogLevel::Debug, &format!("Event(Rename::{} -> {}) Message (id: {}) succesfully sent downstream",
                                                         f_filename, t_filename, res.message_id.unwrap())),
-                Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{} -> {}) Message failed to send :: {}",
+                Err(e) => log(LogLevel::Critical, &format!("Event(Rename::{} -> {}) Message failed to send :: {}",
                                                         f_filename, t_filename, e))
             }
             unblacklist_file(&t, watcher);
@@ -216,10 +216,14 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                 ..Default::default()
             };
             match sqs.send_message(request).await {
-                Ok(res) => log(LogLevel::Debug, &format!("Event(Remove::{}) Message (id: {}) succesfully sent downstream",
-                                                        f_filename, res.message_id.unwrap())),
-                Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{}) Message failed to send :: {}",
-                                                        f_filename, e))
+                Ok(res) => {
+                    log(LogLevel::Debug, &format!("Event(Remove::{}) Message (id: {}) succesfully sent downstream",
+                                                        f_filename, res.message_id.unwrap()));
+                },
+                Err(e) => {
+                    log(LogLevel::Critical, &format!("Event(Remove::{}) Message failed to send :: {}",
+                                                        f_filename, e));
+                }
             }
             /* remove f from the metastore, or do nothing if not there */
             metastore.rem(&f).unwrap();
