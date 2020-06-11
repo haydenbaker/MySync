@@ -47,7 +47,7 @@ struct ServerConfig {
     sqs_prefix: String
 }
 
-/* default configuration for client - '~/.config/sync-client' */
+/* default configuration for server - '~/.config/sync-server' */
 impl ::std::default::Default for ServerConfig {
     fn default() -> Self { Self { 
         version: 0,

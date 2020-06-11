@@ -24,7 +24,9 @@ Install necessary packages to build the binaries
 
 
 ### Configuration
-To configure the service to work, you must edit the sync-client/server configuration files with:
+Configuration files for both of the services exist, by default, at ```~/.config/sync-client``` and ```~/.config/sync-server```
+
+To configure the services to work, you must edit the sync-client/server configuration files with:
 - valid AWS credentials
 - a client-id, only the client config requires this
 - sync directory (must be of following format: ```/dir1/dir2/```), only the client config requires this
