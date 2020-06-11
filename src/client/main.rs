@@ -230,6 +230,7 @@ async fn main() {
         /* try to receive messages from the sync server before handling local events */
         let event_msgs = receive_messages(&sqs, sqs_request.clone()).await;
         for event_msg in event_msgs {
+            println!("event: {:?}", event_msg);
             handle_event_message(&event_msg, &mut metastore, &mut watcher, &s3).await;
         }
 

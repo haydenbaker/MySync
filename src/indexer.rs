@@ -423,7 +423,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
 
             let path_parent = Path::new(&t).parent().unwrap().to_str().unwrap();
             blacklist_file(&path_parent, watcher);
-            fs::create_dir_all(path_parent);
+            println!("create_dir_all: {:?}", fs::create_dir_all(path_parent));
             unblacklist_file(&path_parent, watcher);
             match fs::metadata(&t) {
                 Ok(md) => {
