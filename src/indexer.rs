@@ -156,7 +156,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                         /* f is a file, handle file create */
                         handle_file_create(&f, &s3, &sqs, metastore).await;
                     }
-                    unblacklist_file(path, watcher);
+                    unblacklist_file(&f, watcher);
                 },
                 Err(e) => {
                     /* unable to get the f's metadata, log it */
