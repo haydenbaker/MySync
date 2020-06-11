@@ -419,7 +419,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
                 return log(LogLevel::Critical, &format!("Could not rename file ({}->{}) :: {}", f, t, e));
             }
             
-            log(LogLevel::Debug, &format!("Renaming file ({}->{}) :: {}", f, t));
+            log(LogLevel::Debug, &format!("Renaming file ({}->{})", f, t));
 
             let path_parent = Path::new(&t).parent().unwrap().to_str().unwrap();
             blacklist_file(&path_parent, watcher);
@@ -448,6 +448,9 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             let f = format!("{}{}", CFG.sync_dir, filename);
             /* watcher should drop events for the file until done */
             blacklist_file(&f, watcher);
+
+            log(LogLevel::Debug, &format!("Removing file ({})", f));
+
             /* rename the file, */
             match fs::metadata(&f) {
                 Ok(md) => {
