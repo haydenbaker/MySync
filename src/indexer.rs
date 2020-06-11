@@ -419,7 +419,7 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             blacklist_file(&path_parent, watcher);
             println!("create_dir_all: {:?}", fs::create_dir_all(path_parent));
             unblacklist_file(&path_parent, watcher);
-            
+
             /* rename the file */ 
             if let Err(e) = fs::rename(&f, &t) {
                 return log(LogLevel::Critical, &format!("Could not rename file ({}->{}) :: {}", f, t, e));
