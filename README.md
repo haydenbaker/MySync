@@ -44,7 +44,7 @@ Both services can be run in development mode by:
 However, you should really build the binaries for the individual services
 ```cargo build --bin client --release```
 ```cargo build --bin server --release```  
-Both binaries should be built and placed within ```target/release```
+Both binaries should be built and placed within ```target/release```  
 Be wary that building in release mode will take a few minutes, since this application relies on a few heavyweight crates
 
 ## Deployment
