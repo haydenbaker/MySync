@@ -156,7 +156,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                         /* f is a file, handle file create */
                         handle_file_create(&f, &s3, &sqs, metastore).await;
                     }
-                    watcher.watch(&f, RecursiveMode::NonRecursive);
+                    unblacklist_file(path, watcher);
                 },
                 Err(e) => {
                     /* unable to get the f's metadata, log it */
@@ -178,10 +178,9 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                     } else {
                         apply_file_rename(&f, &t, metastore);
                     }
-                    watcher.watch(&t, RecursiveMode::NonRecursive);
                 },
                 Err(e) => {
-                    log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e))
+                    return log(LogLevel::Critical, &format!("Could not read source file ({}) metadata! :: {}", f, e));
                 }
             }
             let request = SendMessageRequest {
@@ -200,7 +199,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                 Err(e) => log(LogLevel::Critical, &format!("Event(Remove::{} -> {}) Message failed to send :: {}",
                                                         f_filename, t_filename, e))
             }
-            watcher.watch(&t, RecursiveMode::NonRecursive);
+            unblacklist_file(&t, watcher);
         },
         /* a file or dir remove */
         Event::Remove(f) => {
@@ -247,7 +246,7 @@ pub async fn handle_dir_create(path: &str, s3: &S3Client, sqs: &SqsClient, metas
                         /* ent is a file, so we must handle file create */
                         handle_file_create(&path_str, s3, sqs, metastore);
                     }
-                    watcher.watch(&path_str, RecursiveMode::NonRecursive);
+                    unblacklist_file(&path_str, watcher);
                 } 
             }
         },
@@ -679,7 +678,7 @@ pub fn apply_dir_rename(path: &str, path_old: &str, metastore: &mut PickleDb, wa
                         metastore.set(&format!("{}/{}", path, filename), &sig);
                     }
                 }
-                watcher.watch(path, RecursiveMode::NonRecursive);
+                unblacklist_file(path, watcher);
             }
         },
         Err(e) => {
