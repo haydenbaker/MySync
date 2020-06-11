@@ -51,6 +51,10 @@ Be wary that building in release mode will take a few minutes, since this applic
 Before running the services, you must set up and configure the necessary AWS services (since that's what it uses)  
 - Additionally, ensure that the services you set up are in `us-east-1` 
 
+### EC2
+Using free-tier instances, you can boot up ubuntu boxes, which you can then follow this guide. Exact configuation is not important as of now.  
+Client and Server can technically be on the same instance, since they're decoupled via SQS, but the details are up to you. However, the synchronization server be as close as possible (lowest latency) to the other AWS services
+
 ### S3
 You should have a single bucket set up with the same name as you specify in your configuration files  
 The actual objects that will be placed in S3 are the chunks of files, which are named based on their content-defined hash (Adler32)  
