@@ -1,6 +1,5 @@
 # MySync  
-CSC-492: Senior Project  
-Hayden Baker
+Hayden Baker  
 A Rust-based implementation of a file-synchronization service
 
 ## Getting Started
