@@ -90,7 +90,7 @@ pub async fn resync_file(path: &str, metastore: &PickleDb, s3: &S3Client) -> Res
                         /* sig not match, handle discrepancies by iterating through entire ms-sig,
                             and cross-referencing the chunks */
                         log(LogLevel::Warning, &format!("Resyncing from disk for file ({})", path));
-                        if let Ok(mut file) = fs::OpenOptions::new().write(true).create(true).open(path) {
+                        if let Ok(mut file) = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path) {
                             for chunk_id in sig.chunks.keys() {
                                 for offset in sig.chunks.get(chunk_id).unwrap().values().next().unwrap() {
                                     file.seek(std::io::SeekFrom::Start(*offset as u64));
@@ -393,13 +393,14 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             /* a file write requires the most work by far */
             let f = format!("{}{}", CFG.sync_dir, filename);
             /* blacklist the file */
-            blacklist_file(&f, watcher);
 
             let path_parent = Path::new(&f).parent().unwrap().to_str().unwrap();
             blacklist_file(&path_parent, watcher);
             fs::create_dir_all(path_parent);
             unblacklist_file(&path_parent, watcher);
-            
+
+            blacklist_file(&f, watcher);
+
             match &em.d {
                 Some(d) => {
                     apply_file_write(&f, &d, metastore, s3).await;
@@ -417,12 +418,13 @@ pub async fn handle_event_message(em: &EventMessage, metastore: &mut PickleDb, w
             let f = format!("{}{}", CFG.sync_dir, f_filename);
             let t = format!("{}{}", CFG.sync_dir, t_filename);
             /* watcher should drop events for the files until done */
-            blacklist_file(&f, watcher);
-            blacklist_file(&t, watcher);
 
             let path_parent = Path::new(&t).parent().unwrap().to_str().unwrap();
             blacklist_file(&path_parent, watcher);
             fs::create_dir_all(path_parent);
+
+            blacklist_file(&f, watcher);
+            blacklist_file(&t, watcher);
             /* rename the file */ 
             if let Err(e) = fs::rename(&f, &t) {
                 return log(LogLevel::Critical, &format!("Could not rename file ({}->{}) :: {}", f, t, e));
