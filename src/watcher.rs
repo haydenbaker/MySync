@@ -43,7 +43,7 @@ pub fn handle_inotify_event(e: DebouncedEvent, tx: &Sender<Event>, notify_rx: &R
                         /* need to get the duplicate remove event out for the rename,
                             very janky, but I'm fairly certain the remove event will always immediately
                             follow the rename event */
-                        notify_rx.recv();
+                        notify_rx.try_recv();
                         tx.send(Event::Rename(pf, pt));
                     },
                     /* Normal to hidden rename (remove) */

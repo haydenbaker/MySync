@@ -24,6 +24,7 @@ pickledb = "0.4.1"
 blake2-rfc = "0.2"
 walkdir = "2.3.1"
 crossbeam = "0.7.3"
+async-recursion = "0.3.1"
 
 my_rustsync = { path = "my_rustsync" }
 my_notify = { path = "my_notify" }

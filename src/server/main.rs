@@ -112,7 +112,7 @@ async fn main() {
             return log(LogLevel::Critical, &format!("Cannot connect to SQS (sync-downstream.fifo) :: {}", e));
         },
     }
-    println!("cs: {:?}", clientstore);
+    // println!("cs: {:?}", clientstore);
 
     /* request struct for getting downstream messages */
     let sqs_request = ReceiveMessageRequest {
@@ -142,7 +142,7 @@ async fn main() {
         /* try to receive messages from the sync server before handling local events */
         let event_msgs = receive_messages(&sqs, sqs_request.clone()).await;
         for event_msg in event_msgs {
-            println!("em: {:?}", event_msg);
+            // println!("em: {:?}", event_msg);
             handle_event_message(&event_msg, &mut clientstore, &sqs, &db).await;
         }
     }

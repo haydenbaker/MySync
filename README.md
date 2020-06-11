@@ -32,8 +32,9 @@ To configure the services to work, you must edit the sync-client/server configur
 - sync directory (must be of following format: `/dir1/dir2/`), only the client config requires this
 - s3 bucket name
 - the downstream queue handle
-- the sqs handle prefix (i.e. `https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxxxxxx`)
+- the sqs handle prefix (i.e. `https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxxxxxx`)  
 
+Additionally, you must ensure that the process running the client has permissions to read and write the sync-directory  
 
 ### Running
 Both services can be run in development mode by:

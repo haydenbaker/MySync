@@ -8,6 +8,7 @@ use my_notify::{Result, inotify::INotifyWatcher};
 use std::io::prelude::*;
 use blake2_rfc;
 use my_notify::{Watcher, RecursiveMode};
+use async_recursion::async_recursion;
 
 use crate::event::*;
 use crate::log::*;
@@ -151,6 +152,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
                 Ok(md) => {
                     if md.is_dir() {
                         /* f is a dir, handle dir create */
+                        log(LogLevel::Debug, &format!("Handling directory creation ({})", f));
                         handle_dir_create(&f, &s3, &sqs, metastore, watcher).await;
                     } else {
                         /* f is a file, handle file create */
@@ -234,6 +236,7 @@ pub async fn handle_watcher_event(msg: Event, s3: &S3Client, sqs: &SqsClient, me
     }
 }
 
+#[async_recursion]
 pub async fn handle_dir_create(path: &str, s3: &S3Client, sqs: &SqsClient, metastore: &mut PickleDb, watcher: &mut INotifyWatcher) {
     /* if a dir create event, there could be files in the dir that must be propogated */
     match fs::read_dir(path) {
@@ -245,10 +248,10 @@ pub async fn handle_dir_create(path: &str, s3: &S3Client, sqs: &SqsClient, metas
                     let path_str = entry_path.clone().into_os_string().into_string().unwrap();
                     if entry_path.is_dir() {
                         /* recurse on a dir */
-                        handle_dir_create(&path_str, s3, sqs, metastore, watcher);
+                        handle_dir_create(&path_str, s3, sqs, metastore, watcher).await;
                     } else {
                         /* ent is a file, so we must handle file create */
-                        handle_file_create(&path_str, s3, sqs, metastore);
+                        handle_file_create(&path_str, s3, sqs, metastore).await;
                     }
                     unblacklist_file(&path_str, watcher);
                 } 
@@ -336,7 +339,8 @@ pub async fn handle_file_create(path: &str, s3: &S3Client, sqs: &SqsClient, meta
                         /* check if chunks exists on s3 already */
                         if validate_chunk(*k, s3).await {
                             continue;
-                        }                        let offset : usize = *v.values().next().unwrap().first().unwrap();
+                        }                        
+                        let offset : usize = *v.values().next().unwrap().first().unwrap();
                         let offset_end : usize = if offset + CHUNK_SIZE <= source.len() { offset + CHUNK_SIZE } else { source.len() };
                         match s3.put_object(PutObjectRequest {
                             bucket: String::from(&CFG.s3_bucket),
@@ -584,7 +588,7 @@ pub async fn apply_file_write(path: &str, delta: &MyDelta, metastore: &mut Pickl
     /* As it stands, the easiest way to do this is to basically read file into mem */
     match fs::read(path) {
         Ok(source) => {
-            match fs::OpenOptions::new().write(true).open(path) {
+            match fs::OpenOptions::new().write(true).truncate(true).open(path) {
                 Ok(mut file) => {
                     match metastore.get::<Signature>(path) {
                         Some(sig) => {
